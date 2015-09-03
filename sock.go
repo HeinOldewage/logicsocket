@@ -14,23 +14,38 @@ type LogicReaderWriter struct {
 	lc       *LogicConnection
 }
 
-type req struct {
+type writeReq struct {
 	name int32
 	data []byte
 	done chan error
 }
 
 type LogicConnection struct {
-	write chan req
-	read  map[int32]chan []byte
-	lock  sync.Mutex
-	conn  net.Conn
+	write     chan writeReq
+	read      map[int32]*readReq
+	readError error
+	lock      sync.Mutex
+	conn      net.Conn
+}
+
+type readReq struct {
+	data chan []byte
+	err  chan error
+}
+
+func (rq *readReq) read() ([]byte, error) {
+	select {
+	case d := <-rq.data:
+		return d, nil
+	case err := <-rq.err:
+		return nil, err
+	}
 }
 
 func Wrap(c net.Conn) *LogicConnection {
 	res := &LogicConnection{
-		write: make(chan req),
-		read:  make(map[int32]chan []byte),
+		write: make(chan writeReq, 10),
+		read:  make(map[int32]*readReq),
 		conn:  c,
 	}
 	go res.doRead()
@@ -38,13 +53,16 @@ func Wrap(c net.Conn) *LogicConnection {
 	return res
 }
 
-func (lc *LogicConnection) getReadChan(name int32) (res chan []byte) {
+func (lc *LogicConnection) getReadChan(name int32) (res *readReq) {
 	lc.lock.Lock()
 	defer lc.lock.Unlock()
 	var ok bool
 	if res, ok = lc.read[name]; !ok {
-		res = make(chan []byte)
+		res = &readReq{make(chan []byte, 1), make(chan error, 1)}
 		lc.read[name] = res
+		if lc.readError != nil {
+			res.err <- lc.readError
+		}
 	}
 	return res
 }
@@ -55,6 +73,15 @@ func (lc *LogicConnection) removeReadChan(name int32) {
 	delete(lc.read, name)
 }
 
+func (lc *LogicConnection) setError(e error) {
+	lc.lock.Lock()
+	defer lc.lock.Unlock()
+	lc.readError = e
+	for _, v := range lc.read {
+		v.err <- e
+	}
+}
+
 func (lc *LogicConnection) doRead() {
 	for {
 		buffer := make([]byte, 8)
@@ -62,7 +89,7 @@ func (lc *LogicConnection) doRead() {
 		for totalread < 8 {
 			n, err := lc.conn.Read(buffer[totalread:])
 			if err != nil {
-				log.Fatal("doRead 0 ", err, n)
+				lc.setError(err)
 				return
 			}
 			totalread += int32(n)
@@ -72,7 +99,7 @@ func (lc *LogicConnection) doRead() {
 		var size int32
 		err := binary.Read(reader, binary.BigEndian, &name)
 		if err != nil {
-			log.Fatal("doRead 1 ", err)
+			lc.setError(err)
 			return
 		}
 		err = binary.Read(reader, binary.BigEndian, &size)
@@ -80,18 +107,24 @@ func (lc *LogicConnection) doRead() {
 			log.Fatal("doRead 2 ", err)
 			return
 		}
+		c := lc.getReadChan(name)
 		buffer = make([]byte, size)
 		totalread = 0
 		for totalread < size {
 			n, err := lc.conn.Read(buffer[totalread:])
 			if err != nil {
-				log.Fatal("doRead 3", err)
+				if v, ok := err.(*net.OpError); ok && v.Temporary() {
+					c.err <- err
+				} else {
+					lc.setError(err)
+				}
+
 				return
 			}
 			totalread += int32(n)
 		}
-		c := lc.getReadChan(name)
-		c <- buffer
+
+		c.data <- buffer
 	}
 }
 
@@ -127,7 +160,11 @@ func (lc *LogicConnection) NewConnection(name int32) *LogicReaderWriter {
 func (lrw *LogicReaderWriter) Read(p []byte) (n int, err error) {
 	c := lrw.lc.getReadChan(lrw.name)
 	if len(lrw.readBuff) == 0 {
-		lrw.readBuff = append(lrw.readBuff, <-c...)
+		data, err := c.read()
+		if err != nil {
+			return 0, err
+		}
+		lrw.readBuff = append(lrw.readBuff, data...)
 	}
 	n = copy(p, lrw.readBuff)
 	lrw.readBuff = lrw.readBuff[n:]
@@ -135,7 +172,7 @@ func (lrw *LogicReaderWriter) Read(p []byte) (n int, err error) {
 }
 
 func (lrw *LogicReaderWriter) Write(p []byte) (n int, err error) {
-	r := req{
+	r := writeReq{
 		name: lrw.name,
 		data: p,
 		done: make(chan error),
@@ -150,5 +187,6 @@ func (lrw *LogicReaderWriter) Write(p []byte) (n int, err error) {
 }
 
 func (lrw *LogicReaderWriter) Close() error {
-
+	lrw.lc.removeReadChan(lrw.name)
+	return nil
 }
